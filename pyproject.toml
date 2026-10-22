@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pincer-trace"
+version = "0.1.0"
+description = "Local execution traces for the OpenAI Agents SDK"
+requires-python = ">=3.10"
+dependencies = ["openai-agents==0.24.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+pincer = "pincer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Pincer: offline trace demo",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/examples/offline_trace.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    }
+  ]
+}
