@@ -2,12 +2,11 @@
 
 A Python foundation for recording and inspecting OpenAI Agents SDK traces locally.
 This iteration provides a tracing adapter, JSON Lines storage, and a terminal viewer.
-It does **not** implement checkpoint restoration, replay, or resume.
+It does **not** currently implement checkpoint restoration, replay, or resume; these features are planned in the 'debugger.'
 
 ## Set up in VS Code
 
-Open this repository folder in VS Code. Install Microsoft's Python and Python
-Debugger extensions. Python 3.10+ is required; this foundation was tested on 3.12.
+Python 3.10+ and Python Debugger extensions required; this foundation was tested on 3.12.
 
 ```bash
 python -m venv .venv
@@ -39,8 +38,8 @@ pincer traces/offline-<printed-id>.jsonl
 
 Use the actual path printed by the example. Each run creates a new file. The demo
 emits synthetic model/tool spans through the **real SDK tracing callbacks**,
-including a deliberately marked tool failure. It does not call a model or run a
-real agent. The viewer reads the file only; it never contacts a provider.
+including a marked tool failure. It does not call a model or run a
+real agent. The viewer reads the file only and never contacts a provider.
 
 ## Attach to your agent
 
@@ -72,11 +71,9 @@ The public SDK interfaces are documented at
 
 ## Optional live API smoke test
 
-Only this example incurs model usage. Configure API billing and set a key in your
-terminal environment. Never put the key in source, launch configuration, or chat.
-The example accepts `PINCER_OPENAI_API_KEY` first, then `OPENAI_API_KEY`; the former
+Only this example incurs model usage. Example shows accepting `PINCER_OPENAI_API_KEY` first, then `OPENAI_API_KEY`; the former
 can be used with a supported cloud secret binding. `.env` files are ignored by Git
-but are **not automatically loaded**.
+but are not automatically loaded.
 
 ```bash
 python examples/live_agent.py --model YOUR_MODEL_ID
