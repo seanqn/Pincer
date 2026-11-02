@@ -1,8 +1,9 @@
 # Pincer
 
 A Python foundation for recording and inspecting OpenAI Agents SDK traces locally.
-This iteration provides a tracing adapter, JSON Lines storage, and a terminal viewer.
-It does **not** currently implement checkpoint restoration, replay, or resume; these features are planned in the 'debugger.'
+This iteration provides a tracing adapter, JSON Lines storage, a terminal viewer,
+and a read-only step debugger. It does **not** implement checkpoint storage,
+restoration, replay, resume, or budget enforcement.
 
 ## Set up in VS Code
 
@@ -40,6 +41,59 @@ Use the actual path printed by the example. Each run creates a new file. The dem
 emits synthetic model/tool spans through the **real SDK tracing callbacks**,
 including a marked tool failure. It does not call a model or run a
 real agent. The viewer reads the file only and never contacts a provider.
+
+## Inspect steps in the debugger
+
+Use the same printed file path from the offline example:
+
+```bash
+pincer debug traces/offline-<printed-id>.jsonl
+```
+
+The debugger loads a saved JSONL file once. Each model request or tool invocation
+is one step, pairing its start/end events by trace and span IDs. Steps are numbered
+in first-observation order and shown under their parent agent. Concurrent spans
+can overlap; the list is not a claim that execution was sequential.
+
+```text
+Commands: list | select <step> | details | next | previous | help | quit
+
+pincer(debug)> select 2
+Selected: Step 02 - "lookup"
+...
+Checkpoint assessment:
+  Completed boundary: yes (start and end recorded)
+  Checkpoint candidate: yes (boundary only)
+  Resumable state saved: no
+```
+
+`list` shows all steps; `select 3` inspects the offline demo's deliberate failure.
+`next` and `previous` navigate saved records only. `details` shows the selected
+step's IDs, timing, input/output when recorded, error, and latest usage snapshot.
+Start/end usage is not added together. Missing usage is unknown, not zero.
+Use `help` to list commands and `quit`, Ctrl-D (EOF), or Ctrl-C to leave.
+
+For a noninteractive overview:
+
+```bash
+pincer debug traces/offline-<printed-id>.jsonl --list
+```
+
+The original `pincer TRACE` event viewer is still available. Both commands share
+the same saved-event reader. `python -m pincer.cli debug TRACE` is also supported.
+
+A **checkpoint candidate** is only a model/tool span with both endpoints and an
+end status of `ended_without_reported_error`. It does not prove success, save
+resumable state, or establish that repeating an operation is safe. Failed and
+incomplete steps are not marked as candidates. Missing trace/agent endpoints are
+also flagged, even when individual steps have both endpoints. Malformed records
+and ambiguous duplicate span events produce a line-numbered error.
+
+The demo always has two candidate boundaries followed by one error-marked tool
+step. Its enclosing agent and trace still end: displaying an error does not mean
+the debugger stopped execution. Default traces omit inputs, outputs, and error
+text; the debugger cannot recover that content. It neither executes steps nor
+contacts a model, writes checkpoints, retries work, or enforces spending limits.
 
 ## Attach to your agent
 
