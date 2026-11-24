@@ -23,6 +23,14 @@ class OpenAIAgentsTraceAdapter(TracingProcessor):
     running. Do not close this processor while its agents are still running.
     """
 
+    """ 
+    Add. note: custom adapter does not perform network requests, but OpenAPI
+    Agents SDK default tracing processor does (to export to OpenAI). Registering
+    with add_trace_processor() preserves existing processors. To route only through
+    this custom processor, set: processor = OpenAIAgentsTraceAdapter("traces.jsonl")
+    and set_trace_processors([processor])
+    """
+
     def __init__(self, path: str | Path, *, capture_content: bool = False):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
