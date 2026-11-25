@@ -18,9 +18,10 @@ class OpenAIAgentsTraceAdapter(TracingProcessor):
     """Write one JSON object per callback, without network export.
 
     One adapter owns one new file; existing files are never overwritten. Callbacks
-    serialize under a lock. Writes are flushed but not fsynced. Errors are logged
-    and counted instead of interrupting the agent. Inspect ``write_errors`` after
-    running. Do not close this processor while its agents are still running.
+    serialize under a lock. Writes are unbuffered but not fsynced. Errors are logged
+    and counted instead of interrupting the agent. Each record includes the prior
+    error count. Inspect ``write_errors`` after running for errors at the end of
+    the recording. Do not close this processor while its agents are still running.
     """
 
     """ 
@@ -34,7 +35,7 @@ class OpenAIAgentsTraceAdapter(TracingProcessor):
     def __init__(self, path: str | Path, *, capture_content: bool = False):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self.path.open("x", encoding="utf-8")
+        self._file = self.path.open("xb", buffering=0)
         self.capture_content = capture_content
         self._lock = Lock()
         self._sequence = 0
@@ -69,6 +70,7 @@ class OpenAIAgentsTraceAdapter(TracingProcessor):
                     "schema_version": 1,
                     "event_id": str(uuid4()),
                     "sequence": self._sequence + 1,
+                    "write_errors": self.write_errors,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "source": "openai-agents",
                     "event": event,
@@ -87,9 +89,13 @@ class OpenAIAgentsTraceAdapter(TracingProcessor):
                     "error": (error if self.capture_content else {"message": "[content omitted]"}) if error else None,
                     "details": details,
                 }
-                encoded = json.dumps(record, ensure_ascii=True, allow_nan=False)
-                self._file.write(encoded + "\n")
-                self._file.flush()
+                encoded = (json.dumps(record, ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+                written = self._file.write(encoded)
+                if written != len(encoded):
+                    # A partial line cannot safely be followed by another record.
+                    if written:
+                        self._file.close()
+                    raise OSError("Incomplete trace write")
                 self._sequence += 1
             except Exception:
                 self.write_errors += 1

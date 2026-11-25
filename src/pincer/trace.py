@@ -34,6 +34,9 @@ class TraceRecordReader:
                 raise ValueError("unsupported record")
             if type(event["sequence"]) is not int or event["sequence"] <= self._sequence:
                 raise ValueError("invalid sequence")
+            write_errors = event.get("write_errors", 0)
+            if type(write_errors) is not int or write_errors < 0:
+                raise ValueError("invalid write error count")
             if event["event"] not in (
                 "trace.started", "trace.ended", "span.started", "span.ended"
             ):

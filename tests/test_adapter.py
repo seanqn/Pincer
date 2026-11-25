@@ -8,6 +8,8 @@ from openai.types.responses import Response
 
 from pincer import OpenAIAgentsTraceAdapter
 from pincer.cli import render
+from pincer.debugger import TraceView
+from pincer.trace import TraceRecordReader
 
 
 @pytest.fixture
@@ -89,6 +91,63 @@ def test_write_failure_does_not_break_agent(recording):
     assert recording.write_errors == 2
     recording.force_flush()
     recording.shutdown()
+
+
+@pytest.mark.parametrize("missing", ["start", "end"])
+def test_failed_endpoint_is_visible_without_sequence_gap(recording, monkeypatch, caplog, missing):
+    write = recording._file.write
+
+    def fail_endpoint(encoded):
+        if json.loads(encoded)["event"] == f"span.{missing}ed":
+            raise OSError("private write error")
+        return write(encoded)
+
+    monkeypatch.setattr(recording._file, "write", fail_endpoint)
+    with trace("recording failure"):
+        with function_span(name="lookup"):
+            pass
+
+    assert recording.write_errors == 1
+    assert "private write error" not in caplog.text
+    events = records(recording)
+    assert [event["sequence"] for event in events] == [1, 2, 3]
+    assert events[-1]["write_errors"] == 1
+
+    reader = TraceRecordReader()
+    view = TraceView()
+    with recording.path.open(encoding="utf-8") as source:
+        for line in source:
+            for event in reader.feed(line):
+                view.add_event(event)
+
+    assert view.write_errors == 1
+    step = view.steps[0]
+    assert step.missing_endpoint == missing
+    assert not step.failed
+    assert not step.candidate
+    assert f"missing {missing} (observation gap)" in view.detail(0)
+    for output in (view.listing(), render(recording.path)):
+        assert "Recording errors reported by adapter: 1" in output
+        assert "observation gap" in output
+
+
+def test_partial_write_stops_recording_before_appending_another_record(recording, monkeypatch):
+    write = recording._file.write
+
+    def partial_write(encoded):
+        if json.loads(encoded)["event"] == "span.ended":
+            return write(encoded[:12])
+        return write(encoded)
+
+    monkeypatch.setattr(recording._file, "write", partial_write)
+    with trace("partial write"):
+        with function_span(name="lookup"):
+            pass
+
+    assert recording.write_errors == 2
+    assert len(recording.path.read_bytes().splitlines()) == 3
+    with pytest.raises(ValueError, match="Invalid trace record at line 3"):
+        render(recording.path)
 
 
 def test_existing_file_not_overwritten(recording):

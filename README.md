@@ -152,8 +152,8 @@ included when exposed by the SDK; absent usage does not mean zero usage.
 - `trace.started` / `trace.ended` delimit an observed trace, not business success.
 - `span.started` records entry; `span.ended` reports an SDK error if supplied.
 - `ended_without_reported_error` does not prove the operation succeeded.
-- Unmatched starts appear as **INCOMPLETE** in the viewer. A missing end does not
-  prove the external operation failed or is safe to repeat.
+- A missing start or end appears as **INCOMPLETE**. This observation gap leaves
+  the execution state unknown unless the runner reports it separately.
 - Tool errors handled by the framework may appear inside otherwise completed runs.
   Pincer relies on SDK error reporting and cannot infer failures hidden in outputs.
 
@@ -163,9 +163,12 @@ of these labels. `capture_content=True` explicitly records SDK payloads and erro
 details without automatic redaction. Only enable it with data you can store locally.
 SDK settings can also suppress payloads before Pincer receives them.
 
-Files are created exclusively, and each event is flushed under a thread lock.
+Files are created exclusively, and each event is written under a thread lock.
 There is no multi-process shared-file support, fsync durability guarantee, rotation,
-or retention policy. Partial/corrupt lines produce a line-numbered viewer error;
-recording I/O errors are logged without payloads and counted in `write_errors`.
+or retention policy. Partial or corrupt lines produce a line-numbered viewer error.
+Recording errors are logged without payloads and counted in `write_errors`. Each
+saved record carries the cumulative count so far and uses the next consecutive
+sequence number. Check the adapter's final count for failures after the last saved
+record. Earlier schema-v1 files may omit the count.
 Callbacks write synchronously, appropriate for this small foundation rather than
 high-throughput production use. A trace is not a recoverable checkpoint.

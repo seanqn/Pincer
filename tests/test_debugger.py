@@ -94,6 +94,7 @@ def test_split_span_end_updates_view_once(offline, tmp_path):
 
 def test_saved_records_validate_lazily_and_report_line(offline, tmp_path):
     start = read_events(offline)[0]
+    start.pop("write_errors", None)
     line = json.dumps(start)
     path = tmp_path / "saved.jsonl"
     path.write_text(line, encoding="utf-8")

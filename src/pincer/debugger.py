@@ -39,8 +39,16 @@ class Span:
         return self.details.get("name", self.details.get("model", self.record["kind"]))
 
     @property
+    def missing_endpoint(self) -> str | None:
+        if self.start is None:
+            return "start"
+        if self.end is None:
+            return "end"
+        return None
+
+    @property
     def complete(self) -> bool:
-        return self.start is not None and self.end is not None
+        return self.missing_endpoint is None
 
     @property
     def failed(self) -> bool:
@@ -66,8 +74,9 @@ class Span:
                 "Ended; no reported error" if self.end["status"] == "ended_without_reported_error"
                 else "End status: " + quoted(self.end["status"])
             )
-        if not self.complete:
-            parts.append("INCOMPLETE: missing " + ("start" if self.start is None else "end"))
+        missing = self.missing_endpoint
+        if missing:
+            parts.append(f"INCOMPLETE: missing {missing} (observation gap)")
         return "; ".join(parts)
 
 
@@ -75,6 +84,7 @@ class TraceView:
     def __init__(self, events: Iterable[dict] = ()):
         self.spans: dict[tuple[str, str | None], Span] = {}
         self.steps: list[Span] = []
+        self.write_errors = 0
         self._event_count = 0
         for event in events:
             self.add_event(event)
@@ -100,6 +110,7 @@ class TraceView:
             span.start = event
         else:
             span.end = event
+        self.write_errors = max(self.write_errors, event.get("write_errors", 0))
         self._event_count = number
 
     def agent(self, step: Span) -> Span | None:
@@ -123,8 +134,10 @@ class TraceView:
             "Checkpoint candidates are boundaries only; resumable state is not saved.",
         ]
         incomplete = sum(not span.complete for span in self.spans.values())
+        if self.write_errors:
+            lines.append(f"Recording errors reported by adapter: {self.write_errors}")
         if incomplete:
-            lines.append(f"INCOMPLETE: {incomplete} trace/span lifecycle(s) have a missing start or end.")
+            lines.append(f"INCOMPLETE: {incomplete} trace/span lifecycle(s) have an observation gap.")
         if not self.steps:
             lines.append("No model or tool steps recorded.")
         group = None

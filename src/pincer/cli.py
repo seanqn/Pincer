@@ -9,13 +9,16 @@ from .trace import iter_events
 
 def render(path: str | Path) -> str:
     lines = []
-    active = set()
+    starts = set()
+    ends = set()
+    write_errors = 0
     for event in iter_events(path):
         key = (event["trace_id"], event["span_id"])
         if event["event"].endswith("started"):
-            active.add(key)
+            starts.add(key)
         else:
-            active.discard(key)
+            ends.add(key)
+        write_errors = max(write_errors, event.get("write_errors", 0))
         label = event["details"].get("name", event["details"].get("model", event["kind"]))
         # JSON escaping prevents payloads/names injecting terminal controls.
         lines.append(
@@ -29,8 +32,11 @@ def render(path: str | Path) -> str:
             lines.append("     error: " + json.dumps(event["error"], ensure_ascii=True))
         if "usage" in event["details"]:
             lines.append("     usage: " + json.dumps(event["details"]["usage"]))
-    if active:
-        lines.append(f"INCOMPLETE: {len(active)} trace/span start(s) have no recorded end.")
+    if write_errors:
+        lines.append(f"Recording errors reported by adapter: {write_errors}")
+    incomplete = len(starts ^ ends)
+    if incomplete:
+        lines.append(f"INCOMPLETE: {incomplete} trace/span lifecycle(s) have an observation gap.")
     return "\n".join(lines) if lines else "Empty trace: no events recorded."
 
 
