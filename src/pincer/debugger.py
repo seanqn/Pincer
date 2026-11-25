@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from .runner import ToolBreakpoint, read_breakpoint
 from .trace import iter_events
 
 COMMANDS = "Commands: list | select <step> | details | next | previous | help | quit"
@@ -16,6 +18,26 @@ COMMANDS = "Commands: list | select <step> | details | next | previous | help | 
 def quoted(value) -> str:
     """Escape untrusted trace content, including terminal control characters."""
     return json.dumps(value, ensure_ascii=True)
+
+
+def describe_breakpoint(breakpoint: ToolBreakpoint) -> str:
+    status = {
+        "pending": "Paused before dispatch",
+        "dispatching": "Dispatch claimed. Outcome unconfirmed",
+        "completed": "Checkpoint resumed",
+        "failed": "Runner reported a failure",
+    }[breakpoint.status]
+    try:
+        arguments = json.loads(breakpoint.arguments)
+    except ValueError:
+        arguments = breakpoint.arguments
+    return "\n".join([
+        f"Tool breakpoint: {status}",
+        "Tool: " + quoted(breakpoint.name),
+        "Call ID: " + quoted(breakpoint.call_id),
+        "Arguments: " + quoted(arguments),
+        "SDK tool spans can include approval checks. The breakpoint reports dispatch status.",
+    ])
 
 
 @dataclass
@@ -126,13 +148,15 @@ class TraceView:
             parent_id = parent.record["parent_id"]
         return None
 
-    def listing(self, selected: int = 0) -> str:
+    def listing(self, selected: int = 0, *, breakpoint: ToolBreakpoint | None = None) -> str:
         lines = [
             "PINCER DEBUGGER - saved trace",
             "Mode: inspection only | Execution control: unavailable",
             "Order: first observation; overlapping steps may run concurrently.",
-            "Checkpoint candidates are boundaries only; resumable state is not saved.",
+            "Checkpoint candidates mark observed span boundaries.",
         ]
+        if breakpoint is not None:
+            lines.extend(["", describe_breakpoint(breakpoint)])
         incomplete = sum(not span.complete for span in self.spans.values())
         if self.write_errors:
             lines.append(f"Recording errors reported by adapter: {self.write_errors}")
@@ -212,9 +236,9 @@ class TraceView:
         return "\n".join(lines)
 
 
-def inspect(view: TraceView) -> None:
+def inspect(view: TraceView, *, breakpoint: ToolBreakpoint | None = None) -> None:
     selected = 0
-    print(view.listing(selected))
+    print(view.listing(selected, breakpoint=breakpoint))
     while True:
         try:
             command = input("pincer(debug)> ").strip().split()
@@ -228,7 +252,7 @@ def inspect(view: TraceView) -> None:
         if command == ["help"]:
             print(COMMANDS)
         elif command == ["list"]:
-            print(view.listing(selected))
+            print(view.listing(selected, breakpoint=breakpoint))
         elif command in (["next"], ["previous"], ["details"]) or command[0] == "select":
             if not view.steps:
                 print("No model or tool steps recorded.")
@@ -259,15 +283,17 @@ def inspect(view: TraceView) -> None:
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="pincer debug", description=__doc__)
     parser.add_argument("trace", type=Path, help="saved JSONL trace file")
+    parser.add_argument("--checkpoint", type=Path, help="include the saved tool breakpoint")
     parser.add_argument("--list", action="store_true", help="print the step list and exit")
     args = parser.parse_args(argv)
     try:
         view = TraceView(iter_events(args.trace))
+        breakpoint = read_breakpoint(args.checkpoint) if args.checkpoint is not None else None
         if args.list:
-            print(view.listing())
+            print(view.listing(breakpoint=breakpoint))
         else:
-            inspect(view)
-    except (OSError, ValueError) as exc:
+            inspect(view, breakpoint=breakpoint)
+    except (OSError, ValueError, sqlite3.Error) as exc:
         parser.exit(1, f"pincer debug: {quoted(str(exc))}\n")
 
 

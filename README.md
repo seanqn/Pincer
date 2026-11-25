@@ -1,9 +1,9 @@
 # Pincer
 
 A Python foundation for recording and inspecting OpenAI Agents SDK traces locally.
-This iteration provides a tracing adapter, JSON Lines storage, a terminal viewer,
-and a read-only step debugger. It does **not** implement checkpoint storage,
-restoration, replay, resume, or budget enforcement.
+Pincer includes a tracing adapter, JSON Lines storage, a terminal viewer, and a
+read-only step debugger. The offline tool breakpoint demo saves a paused SDK run
+and resumes its pending local function call in a new process.
 
 ## Set up in VS Code
 
@@ -94,6 +94,26 @@ step. Its enclosing agent and trace still end: displaying an error does not mean
 the debugger stopped execution. Default traces omit inputs, outputs, and error
 text; the debugger cannot recover that content. It neither executes steps nor
 contacts a model, writes checkpoints, retries work, or enforces spending limits.
+
+## Pause and resume a tool call offline
+
+```bash
+python examples/tool_breakpoint.py pause traces/breakpoint-demo
+pincer debug traces/breakpoint-demo/paused.jsonl --checkpoint traces/breakpoint-demo/checkpoint.sqlite3 --list
+python examples/tool_breakpoint.py resume traces/breakpoint-demo
+```
+
+The fake model requests `lookup`, and the SDK pauses before invoking the local
+function. The debugger shows the tool name, call ID, arguments, and dispatch
+status. The SDK can emit a tool span during its approval check.
+
+The checkpoint commits the model response and pending call together. `resume`
+approves the saved call and continues in a new process. A checkpoint can be
+claimed once. If the process stops after claiming it, the debugger reports an
+unconfirmed outcome. Use a new directory for a new demo run.
+
+Checkpoint files can contain full model inputs and tool arguments. Resume only
+from checkpoints you trust and use the same agent and tool configuration.
 
 ## Attach to your agent
 
