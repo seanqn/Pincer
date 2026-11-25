@@ -1,7 +1,9 @@
 """Incremental reader for schema-v1 JSONL events."""
 import json
+from codecs import getincrementaldecoder
 from collections.abc import Iterator
 from pathlib import Path
+from typing import BinaryIO
 
 
 class TraceRecordReader:
@@ -71,3 +73,18 @@ def iter_events(path: str | Path) -> Iterator[dict]:
 
 def read_events(path: str | Path) -> list[dict]:
     return list(iter_events(path))
+
+
+class TraceFollower:
+    """Read newly available records from an open, growing trace file."""
+
+    def __init__(self, stream: BinaryIO):
+        self._stream = stream
+        self._reader = TraceRecordReader()
+        self._decode = getincrementaldecoder("utf-8")().decode
+
+    def read_available(self) -> Iterator[dict]:
+        # Both the UTF-8 decoder and record reader retain their partial input
+        # across polls. An empty read leaves the file position as it is.
+        while chunk := self._stream.read(64 * 1024):
+            yield from self._reader.feed(self._decode(chunk))

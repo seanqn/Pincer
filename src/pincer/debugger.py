@@ -1,18 +1,26 @@
-"""Read-only navigation of individual steps in a saved trace."""
+"""Read-only navigation of individual steps in a saved or growing trace."""
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sqlite3
-from collections.abc import Iterable
+import sys
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from threading import Thread
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.application import in_terminal, set_app
 
 from .runner import ToolBreakpoint, read_breakpoint
-from .trace import iter_events
+from .trace import TraceFollower, iter_events
 
 COMMANDS = "Commands: list | select <step> | details | next | previous | help | quit"
+PROMPT = "pincer(debug)> "
+FOLLOW_INTERVAL = 0.1
 
 
 def quoted(value) -> str:
@@ -44,6 +52,7 @@ def describe_breakpoint(breakpoint: ToolBreakpoint) -> str:
 class Span:
     start: dict | None = None
     end: dict | None = None
+    number: int | None = None
 
     @property
     def record(self) -> dict:
@@ -103,16 +112,17 @@ class Span:
 
 
 class TraceView:
-    def __init__(self, events: Iterable[dict] = ()):
+    def __init__(self, events: Iterable[dict] = (), *, following: bool = False):
         self.spans: dict[tuple[str, str | None], Span] = {}
         self.steps: list[Span] = []
+        self.following = following
         self.write_errors = 0
         self._event_count = 0
         for event in events:
             self.add_event(event)
 
-    def add_event(self, event: dict) -> None:
-        """Apply one validated record in input order."""
+    def add_event(self, event: dict) -> Span:
+        """Apply one validated record in input order and return its span."""
         number = self._event_count + 1
         key = (event["trace_id"], event["span_id"])
         span = self.spans.get(key)
@@ -123,6 +133,7 @@ class TraceView:
             # Keep first-observation order, including overlapping spans.
             if event["kind"] in ("model", "tool"):
                 self.steps.append(span)
+                span.number = len(self.steps)
         else:
             if span.end is not None or starting:
                 raise ValueError(f"Ambiguous trace lifecycle at line {number}: duplicate or reversed event")
@@ -134,6 +145,18 @@ class TraceView:
             span.end = event
         self.write_errors = max(self.write_errors, event.get("write_errors", 0))
         self._event_count = number
+        return span
+
+    def is_open(self, span: Span) -> bool:
+        if not self.following or span.missing_endpoint != "end":
+            return False
+        trace = self.spans.get((span.record["trace_id"], None))
+        return trace is None or trace.end is None
+
+    def span_result(self, span: Span) -> str:
+        if self.is_open(span):
+            return "Error reported; Open" if span.failed else "Open"
+        return span.result
 
     def agent(self, step: Span) -> Span | None:
         parent_id = step.record["parent_id"]
@@ -150,18 +173,21 @@ class TraceView:
 
     def listing(self, selected: int = 0, *, breakpoint: ToolBreakpoint | None = None) -> str:
         lines = [
-            "PINCER DEBUGGER - saved trace",
+            "PINCER DEBUGGER - following trace" if self.following else "PINCER DEBUGGER - saved trace",
             "Mode: inspection only | Execution control: unavailable",
             "Order: first observation; overlapping steps may run concurrently.",
             "Checkpoint candidates mark observed span boundaries.",
         ]
         if breakpoint is not None:
             lines.extend(["", describe_breakpoint(breakpoint)])
-        incomplete = sum(not span.complete for span in self.spans.values())
+        open_spans = sum(self.is_open(span) for span in self.spans.values())
+        incomplete = sum(not span.complete for span in self.spans.values()) - open_spans
         if self.write_errors:
             lines.append(f"Recording errors reported by adapter: {self.write_errors}")
         if incomplete:
             lines.append(f"INCOMPLETE: {incomplete} trace/span lifecycle(s) have an observation gap.")
+        if open_spans:
+            lines.append(f"Open trace/span lifecycles: {open_spans}")
         if not self.steps:
             lines.append("No model or tool steps recorded.")
         group = None
@@ -178,7 +204,7 @@ class TraceView:
             marker = ">" if number == selected + 1 else " "
             lines.append(
                 f"{marker}  {number:02d}    {step.record['kind']:5}  {quoted(step.label)}"
-                f" | {step.result} | {'yes (boundary only)' if step.candidate else 'no'}"
+                f" | {self.span_result(step)} | {'yes (boundary only)' if step.candidate else 'no'}"
             )
         lines.extend(["", COMMANDS])
         return "\n".join(lines)
@@ -195,7 +221,7 @@ class TraceView:
             "Span: " + quoted(record["span_id"]),
             "Parent span: " + quoted(record["parent_id"]),
             "Agent: " + (quoted(agent.label) if agent else "not recorded"),
-            "Recorded result: " + step.result,
+            "Recorded result: " + self.span_result(step),
             "SDK start: " + quoted(record.get("started_at")),
             "SDK end: " + quoted(record.get("ended_at")),
         ]
@@ -236,57 +262,182 @@ class TraceView:
         return "\n".join(lines)
 
 
+def _inspect_command(
+    command: list[str], view: TraceView, selected: int, breakpoint: ToolBreakpoint | None
+) -> int:
+    if not command:
+        return selected
+    if command == ["help"]:
+        print(COMMANDS)
+    elif command == ["list"]:
+        print(view.listing(selected, breakpoint=breakpoint))
+    elif command in (["next"], ["previous"], ["details"]) or command[0] == "select":
+        if not view.steps:
+            print("No model or tool steps recorded.")
+            return selected
+        target = selected
+        if command[0] == "select":
+            try:
+                if len(command) != 2:
+                    raise ValueError
+                target = int(command[1]) - 1
+            except ValueError:
+                print("Usage: select <step number>")
+                return selected
+        elif command == ["next"]:
+            target += 1
+        elif command == ["previous"]:
+            target -= 1
+        if not 0 <= target < len(view.steps):
+            print(f"Choose a step from 1 to {len(view.steps)}; selection unchanged.")
+            return selected
+        print(view.detail(target))
+        return target
+    else:
+        print("Unknown command. Navigation only; execution commands are unavailable.")
+        print(COMMANDS)
+    return selected
+
+
 def inspect(view: TraceView, *, breakpoint: ToolBreakpoint | None = None) -> None:
     selected = 0
     print(view.listing(selected, breakpoint=breakpoint))
     while True:
         try:
-            command = input("pincer(debug)> ").strip().split()
+            command = input(PROMPT).strip().split()
         except (EOFError, KeyboardInterrupt):
             print()
             return
-        if not command:
-            continue
         if command == ["quit"]:
             return
-        if command == ["help"]:
-            print(COMMANDS)
-        elif command == ["list"]:
-            print(view.listing(selected, breakpoint=breakpoint))
-        elif command in (["next"], ["previous"], ["details"]) or command[0] == "select":
-            if not view.steps:
-                print("No model or tool steps recorded.")
-                continue
-            target = selected
-            if command[0] == "select":
+        selected = _inspect_command(command, view, selected, breakpoint)
+
+
+def _poll_breakpoint(path: Path | None, previous: ToolBreakpoint | None) -> ToolBreakpoint | None:
+    if path is None or not path.exists():
+        return previous
+    try:
+        return read_breakpoint(path, timeout=0)
+    except sqlite3.OperationalError as exc:
+        # The file can be visible before the runner commits the schema, or
+        # briefly locked during a status update. Try again on the next poll.
+        if str(exc) in {"no such table: breakpoint", "database is locked"}:
+            return previous
+        raise
+
+
+def _piped_commands() -> Callable[[], Awaitable[str | None]]:
+    """Read redirected stdin without blocking the trace or terminal loop."""
+    loop = asyncio.get_running_loop()
+    commands: asyncio.Queue[str | None | OSError | ValueError] = asyncio.Queue()
+
+    def read() -> None:
+        try:
+            try:
+                for line in sys.stdin:
+                    loop.call_soon_threadsafe(commands.put_nowait, line)
+            except (OSError, ValueError) as exc:
+                loop.call_soon_threadsafe(commands.put_nowait, exc)
+            else:
+                loop.call_soon_threadsafe(commands.put_nowait, None)
+        except RuntimeError:
+            if not loop.is_closed():
+                raise
+
+    async def receive() -> str | None:
+        command = await commands.get()
+        if isinstance(command, (OSError, ValueError)):
+            raise command
+        return command
+
+    # On quit or a trace error, the process can exit even if stdin is idle.
+    Thread(target=read, daemon=True).start()
+    return receive
+
+
+async def follow(path: Path, *, checkpoint: Path | None = None) -> None:
+    with path.open("rb") as stream:
+        source = TraceFollower(stream)
+        view = TraceView(source.read_available(), following=True)
+        breakpoint = _poll_breakpoint(checkpoint, None)
+        print(view.listing(breakpoint=breakpoint), flush=True)
+        print("Waiting for events. Quit or press Ctrl-C to stop following.", flush=True)
+
+        prompt = PromptSession(PROMPT) if sys.stdin.isatty() and sys.stdout.isatty() else None
+        read_command = prompt.prompt_async if prompt is not None else _piped_commands()
+
+        async def publish(text: str) -> None:
+            if prompt is None:
+                print(text, flush=True)
+            else:
+                with set_app(prompt.app):
+                    async with in_terminal():
+                        print(text, flush=True)
+
+        async def watch() -> None:
+            nonlocal breakpoint
+            while True:
+                await asyncio.sleep(FOLLOW_INTERVAL)
+                updates = []
+                previous_errors = view.write_errors
+                for event in source.read_available():
+                    span = view.add_event(event)
+                    if span.number is not None:
+                        updates.append(
+                            f"Step {span.number:02d} {quoted(span.label)} | {view.span_result(span)}"
+                        )
+                    elif event["event"] == "trace.ended":
+                        updates.append(f"Trace ended: {quoted(event['trace_id'])}")
+                if view.write_errors != previous_errors:
+                    updates.append(f"Recording errors reported by adapter: {view.write_errors}")
+                latest = _poll_breakpoint(checkpoint, breakpoint)
+                if latest is not None and latest != breakpoint:
+                    breakpoint = latest
+                    updates.append(describe_breakpoint(latest))
+                if updates:
+                    await publish("\n".join(updates))
+
+        async def interact() -> None:
+            selected = 0
+            while True:
                 try:
-                    if len(command) != 2:
-                        raise ValueError
-                    target = int(command[1]) - 1
-                except ValueError:
-                    print("Usage: select <step number>")
-                    continue
-            elif command == ["next"]:
-                target += 1
-            elif command == ["previous"]:
-                target -= 1
-            if not 0 <= target < len(view.steps):
-                print(f"Choose a step from 1 to {len(view.steps)}; selection unchanged.")
-                continue
-            selected = target
-            print(view.detail(selected))
-        else:
-            print("Unknown command. Navigation only; execution commands are unavailable.")
-            print(COMMANDS)
+                    line = await read_command()
+                except (EOFError, KeyboardInterrupt):
+                    return
+                if line is None:
+                    return
+                command = line.strip().split()
+                if command == ["quit"]:
+                    return
+                selected = _inspect_command(command, view, selected, breakpoint)
+                sys.stdout.flush()
+
+        tasks = [asyncio.create_task(watch()), asyncio.create_task(interact())]
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="pincer debug", description=__doc__)
-    parser.add_argument("trace", type=Path, help="saved JSONL trace file")
+    parser.add_argument("trace", type=Path, help="JSONL trace file")
     parser.add_argument("--checkpoint", type=Path, help="include the saved tool breakpoint")
-    parser.add_argument("--list", action="store_true", help="print the step list and exit")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--list", action="store_true", help="print the step list and exit")
+    mode.add_argument("--follow", action="store_true", help="watch a growing trace file for new steps")
     args = parser.parse_args(argv)
     try:
+        if args.follow:
+            try:
+                asyncio.run(follow(args.trace, checkpoint=args.checkpoint))
+            except KeyboardInterrupt:
+                print()
+            return
         view = TraceView(iter_events(args.trace))
         breakpoint = read_breakpoint(args.checkpoint) if args.checkpoint is not None else None
         if args.list:

@@ -55,8 +55,8 @@ def save_breakpoint(path: Path, state: RunState) -> ToolBreakpoint:
     return breakpoint
 
 
-def _load_breakpoint(path: Path, *, include_snapshot: bool = False) -> tuple:
-    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+def _load_breakpoint(path: Path, *, include_snapshot: bool = False, timeout: float = 5.0) -> tuple:
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=timeout)) as db:
         columns = "name, call_id, arguments, status"
         if include_snapshot:
             columns += ", snapshot"
@@ -66,9 +66,9 @@ def _load_breakpoint(path: Path, *, include_snapshot: bool = False) -> tuple:
     return row
 
 
-def read_breakpoint(path: Path) -> ToolBreakpoint:
+def read_breakpoint(path: Path, *, timeout: float = 5.0) -> ToolBreakpoint:
     """Read the debugger's display fields without restoring SDK run state."""
-    return ToolBreakpoint(*_load_breakpoint(path))
+    return ToolBreakpoint(*_load_breakpoint(path, timeout=timeout))
 
 
 async def resume_breakpoint(

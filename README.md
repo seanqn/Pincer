@@ -95,6 +95,22 @@ the debugger stopped execution. Default traces omit inputs, outputs, and error
 text; the debugger cannot recover that content. It neither executes steps nor
 contacts a model, writes checkpoints, retries work, or enforces spending limits.
 
+## Follow a live trace
+
+Once the recording file exists, attach from a separate terminal:
+
+```bash
+pincer debug TRACE --follow
+```
+
+The debugger loads the history, then shows model and tool updates as events
+arrive. Open spans keep their step numbers when they end. Use the same navigation
+commands while the trace grows, and use `quit` or Ctrl-C to detach.
+
+Follow watches one file for appends and keeps waiting after a trace ends. With
+`--checkpoint PATH`, it also shows changes to the committed breakpoint status.
+If the runner resumes into a new file, follow that file to see the resumed spans.
+
 ## Pause and resume a tool call offline
 
 ```bash

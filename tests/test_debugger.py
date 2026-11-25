@@ -1,8 +1,13 @@
 import copy
 import json
+import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Thread
+from time import monotonic
 
 import pytest
 
@@ -204,3 +209,143 @@ def test_ctrl_c_exits_inspection(monkeypatch):
 
     monkeypatch.setattr("builtins.input", interrupt)
     inspect(TraceView([]))
+
+
+@pytest.fixture
+def live_debugger():
+    processes = []
+
+    def start(path, *options):
+        process = subprocess.Popen(
+            [sys.executable, "-m", "pincer.cli", "debug", str(path), "--follow", *options],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        processes.append(process)
+        output = Queue()
+
+        def read_output():
+            for line in process.stdout:
+                output.put(line)
+            output.put(None)
+
+        Thread(target=read_output, daemon=True).start()
+
+        def wait_for(message):
+            deadline = monotonic() + 10
+            seen = []
+            try:
+                while (remaining := deadline - monotonic()) > 0:
+                    line = output.get(timeout=remaining)
+                    if line is None:
+                        break
+                    seen.append(line)
+                    if message in line:
+                        return "".join(seen)
+            except Empty:
+                pass
+            pytest.fail(f"Expected {message!r} in debugger output:\n{''.join(seen)}")
+
+        def command(line):
+            process.stdin.write(line + "\n")
+            process.stdin.flush()
+
+        return process, wait_for, command
+
+    yield start
+    for process in processes:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        process.stdin.close()
+        process.stdout.close()
+
+
+def test_follow_updates_open_step_once_and_keeps_selection(offline, tmp_path, live_debugger):
+    events = read_events(offline)
+    lookup_start = next(
+        i for i, event in enumerate(events)
+        if event["event"] == "span.started" and event["details"].get("name") == "lookup"
+    )
+    history = events[:lookup_start + 1]
+    lookup_end, other_tool_start = events[lookup_start + 1:lookup_start + 3]
+    lookup_end["sequence"], other_tool_start["sequence"] = (
+        other_tool_start["sequence"], lookup_end["sequence"]
+    )
+    lookup_end["details"]["output"] = "café"
+
+    def encode(event):
+        return (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+
+    path = tmp_path / "growing.jsonl"
+    path.write_bytes(b"".join(map(encode, history)))
+    process, wait_for, command = live_debugger(path)
+    assert '"lookup" | Open' in wait_for("Waiting for events")
+    command("select 2")
+    wait_for("Recorded result: Open")
+
+    end_line = encode(lookup_end)
+    split = end_line.index("é".encode("utf-8")) + 1
+    with path.open("ab", buffering=0) as writer:
+        writer.write(encode(other_tool_start) + end_line[:split])
+        wait_for('Step 03 "deliberate_failure" | Open')
+        command("details")
+        assert 'Selected: Step 02 - "lookup"' in wait_for("Recorded result: Open")
+
+        writer.write(end_line[split:-1])
+        command("list")
+        assert '"lookup" | Open' in wait_for("Commands:")
+
+        writer.write(end_line[-1:])
+        wait_for('Step 02 "lookup" | Ended; no reported error')
+        command("details")
+        details = wait_for(r'Output: "caf\u00e9"')
+        assert 'Selected: Step 02 - "lookup"' in details
+        assert 'Step 02 "lookup" | Ended' not in details
+
+        writer.write(encode(events[-1]))
+        wait_for("Trace ended:")
+        command("select 3")
+        wait_for("Recorded result: INCOMPLETE: missing end")
+
+        next_trace = {**events[0], "trace_id": "next-trace", "sequence": events[-1]["sequence"] + 1}
+        next_tool = {
+            **other_tool_start, "trace_id": "next-trace", "sequence": next_trace["sequence"] + 1
+        }
+        writer.write(encode(next_trace) + encode(next_tool))
+        wait_for('Step 04 "deliberate_failure" | Open')
+
+    command("quit")
+    assert process.wait(timeout=5) == 0
+
+
+def test_follow_reports_appended_invalid_record_while_idle(tmp_path, live_debugger):
+    path = tmp_path / "growing.jsonl"
+    path.touch()
+    process, wait_for, _ = live_debugger(path)
+    wait_for("Waiting for events")
+    path.write_bytes(b"{}\n")
+    assert "Traceback" not in wait_for("Invalid trace record at line 1")
+    assert process.wait(timeout=5) == 1
+
+
+def test_follow_displays_committed_checkpoint_changes(tmp_path, live_debugger):
+    path = tmp_path / "growing.jsonl"
+    checkpoint = tmp_path / "checkpoint.sqlite3"
+    path.touch()
+    checkpoint.touch()
+    process, wait_for, command = live_debugger(path, "--checkpoint", str(checkpoint))
+    wait_for("Waiting for events")
+    with closing(sqlite3.connect(checkpoint)) as db:
+        with db:
+            db.execute("BEGIN")
+            db.execute("CREATE TABLE breakpoint (id, name, call_id, arguments, status)")
+            db.execute(
+                "INSERT INTO breakpoint VALUES (1, 'lookup', 'call_demo', '{}', 'pending')"
+            )
+        wait_for("Paused before dispatch")
+        with db:
+            db.execute("UPDATE breakpoint SET status = 'completed' WHERE id = 1")
+        wait_for("Checkpoint resumed")
+    assert path.read_bytes() == b""
+    command("quit")
+    assert process.wait(timeout=5) == 0
