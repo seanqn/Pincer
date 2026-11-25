@@ -4,13 +4,13 @@ import json
 import sys
 from pathlib import Path
 
-from .trace import read_events
+from .trace import iter_events
 
 
 def render(path: str | Path) -> str:
     lines = []
     active = set()
-    for event in read_events(path):
+    for event in iter_events(path):
         key = (event["trace_id"], event["span_id"])
         if event["event"].endswith("started"):
             active.add(key)

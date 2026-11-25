@@ -1,4 +1,5 @@
 import copy
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -7,7 +8,7 @@ import pytest
 
 from pincer.cli import main, render
 from pincer.debugger import TraceView, inspect
-from pincer.trace import read_events
+from pincer.trace import TraceRecordReader, iter_events, read_events
 
 
 @pytest.fixture
@@ -57,6 +58,52 @@ def test_step_pairing_usage_and_snapshot_command(offline, capsys):
     main(["debug", str(offline), "--list"])
     assert "PINCER DEBUGGER" in capsys.readouterr().out
     assert "trace.ended" in render(offline)
+
+
+def test_split_span_end_updates_view_once(offline, tmp_path):
+    start, end = [event for event in read_events(offline) if event["kind"] == "model"]
+    path = tmp_path / "growing.jsonl"
+    path.write_text(json.dumps(start) + "\n", encoding="utf-8")
+    end_line = json.dumps(end) + "\n"
+    split_at = len(end_line) // 2
+    reader = TraceRecordReader()
+    view = TraceView()
+
+    with path.open(encoding="utf-8") as source, path.open("a", encoding="utf-8") as sink:
+        for event in reader.feed(source.read()):
+            view.add_event(event)
+        step = view.steps[0]
+        assert not step.complete
+
+        sink.write(end_line[:split_at])
+        sink.flush()
+        assert list(reader.feed(source.read())) == []
+        assert "INCOMPLETE: missing end" in view.listing()
+
+        sink.write(end_line[split_at:])
+        sink.flush()
+        for event in reader.feed(source.read()):
+            view.add_event(event)
+        assert list(reader.feed(source.read())) == []
+
+    assert view.steps == [step]
+    assert view.steps[0] is step
+    assert step.candidate
+    assert view.listing() == TraceView(iter_events(path)).listing()
+
+
+def test_saved_records_validate_lazily_and_report_line(offline, tmp_path):
+    start = read_events(offline)[0]
+    line = json.dumps(start)
+    path = tmp_path / "saved.jsonl"
+    path.write_text(line, encoding="utf-8")
+    assert list(iter_events(path)) == [start]
+
+    path.write_text(line + "\n" + line, encoding="utf-8")
+    events = iter_events(path)
+    assert next(events) == start
+    with pytest.raises(ValueError, match="Invalid trace record at line 2"):
+        next(events)
 
 
 def test_interleaved_traces_and_end_usage_take_precedence(offline):

@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .trace import read_events
+from .trace import iter_events
 
 COMMANDS = "Commands: list | select <step> | details | next | previous | help | quit"
 
@@ -71,24 +72,35 @@ class Span:
 
 
 class TraceView:
-    def __init__(self, events: list[dict]):
+    def __init__(self, events: Iterable[dict] = ()):
         self.spans: dict[tuple[str, str | None], Span] = {}
-        for number, event in enumerate(events, 1):
-            key = (event["trace_id"], event["span_id"])
-            span = self.spans.setdefault(key, Span())
-            starting = event["event"].endswith("started")
-            if (starting and (span.start or span.end)) or (not starting and span.end):
+        self.steps: list[Span] = []
+        self._event_count = 0
+        for event in events:
+            self.add_event(event)
+
+    def add_event(self, event: dict) -> None:
+        """Apply one validated record in input order."""
+        number = self._event_count + 1
+        key = (event["trace_id"], event["span_id"])
+        span = self.spans.get(key)
+        starting = event["event"].endswith("started")
+        if span is None:
+            span = Span()
+            self.spans[key] = span
+            # Keep first-observation order, including overlapping spans.
+            if event["kind"] in ("model", "tool"):
+                self.steps.append(span)
+        else:
+            if span.end is not None or starting:
                 raise ValueError(f"Ambiguous trace lifecycle at line {number}: duplicate or reversed event")
-            if span.start and any(
-                span.start[field] != event[field] for field in ("kind", "parent_id")
-            ):
+            if any(span.record[field] != event[field] for field in ("kind", "parent_id")):
                 raise ValueError(f"Inconsistent span identity at line {number}")
-            if starting:
-                span.start = event
-            else:
-                span.end = event
-        # Dictionary insertion order preserves first observation, including overlap.
-        self.steps = [span for span in self.spans.values() if span.record["kind"] in ("model", "tool")]
+        if starting:
+            span.start = event
+        else:
+            span.end = event
+        self._event_count = number
 
     def agent(self, step: Span) -> Span | None:
         parent_id = step.record["parent_id"]
@@ -233,11 +245,11 @@ def inspect(view: TraceView) -> None:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="pincer debug", description=__doc__)
-    parser.add_argument("trace", type=Path, help="completed JSONL file (loaded once)")
+    parser.add_argument("trace", type=Path, help="saved JSONL trace file")
     parser.add_argument("--list", action="store_true", help="print the step list and exit")
     args = parser.parse_args(argv)
     try:
-        view = TraceView(read_events(args.trace))
+        view = TraceView(iter_events(args.trace))
         if args.list:
             print(view.listing())
         else:
