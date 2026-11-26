@@ -212,13 +212,13 @@ def test_ctrl_c_exits_inspection(monkeypatch):
 
 
 @pytest.fixture
-def live_debugger():
+def cli_process():
     processes = []
 
-    def start(path, *options):
+    def start(*args, cwd=None):
         process = subprocess.Popen(
-            [sys.executable, "-m", "pincer.cli", "debug", str(path), "--follow", *options],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            [sys.executable, *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True,
         )
         processes.append(process)
         output = Queue()
@@ -258,6 +258,39 @@ def live_debugger():
         process.wait(timeout=5)
         process.stdin.close()
         process.stdout.close()
+
+
+@pytest.fixture
+def live_debugger(cli_process):
+    def start(path, *options):
+        return cli_process("-m", "pincer.cli", "debug", path, "--follow", *options)
+
+    return start
+
+
+def test_offline_live_demo_waits_then_streams_sdk_spans(tmp_path, cli_process, live_debugger):
+    example = Path(__file__).resolve().parents[1] / "examples" / "offline_trace.py"
+    demo, wait_for_demo, demo_command = cli_process(example, "--live", "0.5", cwd=tmp_path)
+    startup = wait_for_demo("Attach in another terminal")
+    path = tmp_path / startup.splitlines()[0]
+    assert path.read_bytes() == b""
+
+    debugger, wait_for, command = live_debugger(path)
+    assert "No model or tool steps recorded." in wait_for("Waiting for events")
+    assert demo.poll() is None
+    demo_command("")
+
+    wait_for('Step 01 "synthetic-model" | Open')
+    wait_for('Step 01 "synthetic-model" | Ended; no reported error')
+    wait_for('Step 02 "lookup" | Open')
+    wait_for('Step 02 "lookup" | Ended; no reported error')
+    wait_for('Step 03 "deliberate_failure" | Open')
+    wait_for('Step 03 "deliberate_failure" | Error reported')
+    wait_for("Trace ended:")
+
+    assert demo.wait(timeout=5) == 0
+    command("quit")
+    assert debugger.wait(timeout=5) == 0
 
 
 def test_follow_updates_open_step_once_and_keeps_selection(offline, tmp_path, live_debugger):

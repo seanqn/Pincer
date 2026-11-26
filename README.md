@@ -97,6 +97,17 @@ contacts a model, writes checkpoints, retries work, or enforces spending limits.
 
 ## Follow a live trace
 
+To try follow mode offline, start the synthetic demo with a delay:
+
+```bash
+python examples/offline_trace.py --live 3
+```
+
+The demo creates the file, prints the exact debugger command, and waits for
+Enter. Run that command in a second terminal, then press Enter in the first
+terminal. The simulated model response and each tool span stay open for three
+seconds. Use `--live` by itself for two seconds per span.
+
 Once the recording file exists, attach from a separate terminal:
 
 ```bash
