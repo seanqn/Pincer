@@ -15,7 +15,7 @@ from threading import Thread
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import in_terminal, set_app
 
-from .runner import ToolBreakpoint, read_breakpoint
+from .checkpoints import Checkpoint, CheckpointHistory, ToolBreakpoint, read_checkpoint_history
 from .trace import TraceFollower, iter_events
 
 COMMANDS = "Commands: list | select <step> | details | next | previous | help | quit"
@@ -46,6 +46,11 @@ def describe_breakpoint(breakpoint: ToolBreakpoint) -> str:
         "Arguments: " + quoted(arguments),
         "SDK tool spans can include approval checks. The breakpoint reports dispatch status.",
     ])
+
+
+def _checkpoint_label(checkpoint: Checkpoint) -> str:
+    kind = "Tool result" if checkpoint.kind == "tool_result" else "Tool approval"
+    return f"Checkpoint {checkpoint.id} | {kind} | {checkpoint.action}"
 
 
 @dataclass
@@ -117,9 +122,39 @@ class TraceView:
         self.steps: list[Span] = []
         self.following = following
         self.write_errors = 0
+        self.checkpoint_history: CheckpointHistory | None = None
+        self.checkpoints_by_span: dict[tuple[str, str], list[Checkpoint]] = {}
         self._event_count = 0
         for event in events:
             self.add_event(event)
+
+    def set_checkpoint_history(self, history: CheckpointHistory | None) -> None:
+        self.checkpoint_history = history
+        self.checkpoints_by_span.clear()
+        if history is not None:
+            for checkpoint in history.checkpoints:
+                if checkpoint.trace_id and checkpoint.span_id:
+                    key = (checkpoint.trace_id, checkpoint.span_id)
+                    self.checkpoints_by_span.setdefault(key, []).append(checkpoint)
+
+    def checkpoint_summary(self) -> str:
+        if self.checkpoint_history is None:
+            return ""
+        lines = ["Committed checkpoints:"]
+        for checkpoint in self.checkpoint_history.checkpoints:
+            line = f"  {_checkpoint_label(checkpoint)} | Tool {quoted(checkpoint.breakpoint.name)}"
+            if checkpoint.trace_path is not None:
+                line += f" | Trace {quoted(checkpoint.trace_path)}"
+            lines.append(line)
+        if self.checkpoint_history.attempts:
+            lines.append("Continuation attempts:")
+        for attempt in self.checkpoint_history.attempts:
+            status = "running or interrupted" if attempt.status == "running" else attempt.status
+            line = f"  Attempt {attempt.id} | Checkpoint {attempt.source_id} | {attempt.action} | {status}"
+            if attempt.trace_path is not None:
+                line += f" | Trace {quoted(attempt.trace_path)}"
+            lines.append(line)
+        return "\n".join(lines)
 
     def add_event(self, event: dict) -> Span:
         """Apply one validated record in input order and return its span."""
@@ -178,6 +213,9 @@ class TraceView:
             "Order: first observation; overlapping steps may run concurrently.",
             "Checkpoint candidates mark observed span boundaries.",
         ]
+        if self.checkpoint_history is not None:
+            lines.extend(["", self.checkpoint_summary()])
+            breakpoint = self.checkpoint_history.breakpoint
         if breakpoint is not None:
             lines.extend(["", describe_breakpoint(breakpoint)])
         open_spans = sum(self.is_open(span) for span in self.spans.values())
@@ -206,12 +244,16 @@ class TraceView:
                 f"{marker}  {number:02d}    {step.record['kind']:5}  {quoted(step.label)}"
                 f" | {self.span_result(step)} | {'yes (boundary only)' if step.candidate else 'no'}"
             )
+            key = (step.record["trace_id"], step.record["span_id"])
+            for checkpoint in self.checkpoints_by_span.get(key, ()):
+                lines.append("      " + _checkpoint_label(checkpoint))
         lines.extend(["", COMMANDS])
         return "\n".join(lines)
 
     def detail(self, index: int) -> str:
         step = self.steps[index]
         record = step.record
+        checkpoints = self.checkpoints_by_span.get((record["trace_id"], record["span_id"]), ())
         details = step.details
         agent = self.agent(step)
         lines = [
@@ -256,9 +298,10 @@ class TraceView:
             "", "Checkpoint assessment:",
             "  Completed boundary: " + ("yes (start and end recorded)" if step.complete else "no"),
             "  Checkpoint candidate: " + ("yes (boundary only)" if step.candidate else "no"),
-            "  Resumable state saved: no",
+            "  Resumable state saved: " + ("yes" if checkpoints else "no"),
             "  No reported error does not prove success or that repeating a step is safe.",
         ])
+        lines.extend("  " + _checkpoint_label(checkpoint) for checkpoint in checkpoints)
         return "\n".join(lines)
 
 
@@ -313,11 +356,11 @@ def inspect(view: TraceView, *, breakpoint: ToolBreakpoint | None = None) -> Non
         selected = _inspect_command(command, view, selected, breakpoint)
 
 
-def _poll_breakpoint(path: Path | None, previous: ToolBreakpoint | None) -> ToolBreakpoint | None:
+def _poll_checkpoints(path: Path | None, previous: CheckpointHistory | None) -> CheckpointHistory | None:
     if path is None or not path.exists():
         return previous
     try:
-        return read_breakpoint(path, timeout=0)
+        return read_checkpoint_history(path, timeout=0)
     except sqlite3.OperationalError as exc:
         # The file can be visible before the runner commits the schema, or
         # briefly locked during a status update. Try again on the next poll.
@@ -359,8 +402,8 @@ async def follow(path: Path, *, checkpoint: Path | None = None) -> None:
     with path.open("rb") as stream:
         source = TraceFollower(stream)
         view = TraceView(source.read_available(), following=True)
-        breakpoint = _poll_breakpoint(checkpoint, None)
-        print(view.listing(breakpoint=breakpoint), flush=True)
+        view.set_checkpoint_history(_poll_checkpoints(checkpoint, None))
+        print(view.listing(), flush=True)
         print("Waiting for events. Quit or press Ctrl-C to stop following.", flush=True)
 
         prompt = PromptSession(PROMPT) if sys.stdin.isatty() and sys.stdout.isatty() else None
@@ -375,7 +418,6 @@ async def follow(path: Path, *, checkpoint: Path | None = None) -> None:
                         print(text, flush=True)
 
         async def watch() -> None:
-            nonlocal breakpoint
             while True:
                 await asyncio.sleep(FOLLOW_INTERVAL)
                 updates = []
@@ -390,10 +432,13 @@ async def follow(path: Path, *, checkpoint: Path | None = None) -> None:
                         updates.append(f"Trace ended: {quoted(event['trace_id'])}")
                 if view.write_errors != previous_errors:
                     updates.append(f"Recording errors reported by adapter: {view.write_errors}")
-                latest = _poll_breakpoint(checkpoint, breakpoint)
-                if latest is not None and latest != breakpoint:
-                    breakpoint = latest
-                    updates.append(describe_breakpoint(latest))
+                previous = view.checkpoint_history
+                latest = _poll_checkpoints(checkpoint, previous)
+                if latest is not None and latest != previous:
+                    view.set_checkpoint_history(latest)
+                    updates.append(view.checkpoint_summary())
+                    if previous is None or previous.breakpoint != latest.breakpoint:
+                        updates.append(describe_breakpoint(latest.breakpoint))
                 if updates:
                     await publish("\n".join(updates))
 
@@ -409,7 +454,7 @@ async def follow(path: Path, *, checkpoint: Path | None = None) -> None:
                 command = line.strip().split()
                 if command == ["quit"]:
                     return
-                selected = _inspect_command(command, view, selected, breakpoint)
+                selected = _inspect_command(command, view, selected, None)
                 sys.stdout.flush()
 
         tasks = [asyncio.create_task(watch()), asyncio.create_task(interact())]
@@ -426,7 +471,7 @@ async def follow(path: Path, *, checkpoint: Path | None = None) -> None:
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="pincer debug", description=__doc__)
     parser.add_argument("trace", type=Path, help="JSONL trace file")
-    parser.add_argument("--checkpoint", type=Path, help="include the saved tool breakpoint")
+    parser.add_argument("--checkpoint", type=Path, help="include committed checkpoints and recovery actions")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--list", action="store_true", help="print the step list and exit")
     mode.add_argument("--follow", action="store_true", help="watch a growing trace file for new steps")
@@ -439,11 +484,12 @@ def main(argv=None):
                 print()
             return
         view = TraceView(iter_events(args.trace))
-        breakpoint = read_breakpoint(args.checkpoint) if args.checkpoint is not None else None
+        if args.checkpoint is not None:
+            view.set_checkpoint_history(read_checkpoint_history(args.checkpoint))
         if args.list:
-            print(view.listing(breakpoint=breakpoint))
+            print(view.listing())
         else:
-            inspect(view, breakpoint=breakpoint)
+            inspect(view)
     except (OSError, ValueError, sqlite3.Error) as exc:
         parser.exit(1, f"pincer debug: {quoted(str(exc))}\n")
 

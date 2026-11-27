@@ -2,8 +2,8 @@
 
 A Python foundation for recording and inspecting OpenAI Agents SDK traces locally.
 Pincer includes a tracing adapter, JSON Lines storage, a terminal viewer, and a
-read-only step debugger. The offline tool breakpoint demo saves a paused SDK run
-and resumes its pending local function call in a new process.
+read-only step debugger. The offline demo can approve a saved tool call or recover
+from its committed result in a new process.
 
 ## Set up in VS Code
 
@@ -118,9 +118,9 @@ The debugger loads the history, then shows model and tool updates as events
 arrive. Open spans keep their step numbers when they end. Use the same navigation
 commands while the trace grows, and use `quit` or Ctrl-C to detach.
 
-Follow watches one file for appends and keeps waiting after a trace ends. With
-`--checkpoint PATH`, it also shows changes to the committed breakpoint status.
-If the runner resumes into a new file, follow that file to see the resumed spans.
+Follow watches one file for appends and keeps waiting after a trace ends.
+`--checkpoint PATH` also shows changes to committed checkpoints and continuation
+attempts. Open the trace listed for an attempt to see its spans.
 
 ## Pause and resume a tool call offline
 
@@ -134,13 +134,44 @@ The fake model requests `lookup`, and the SDK pauses before invoking the local
 function. The debugger shows the tool name, call ID, arguments, and dispatch
 status. The SDK can emit a tool span during its approval check.
 
-The checkpoint commits the model response and pending call together. `resume`
-approves the saved call and continues in a new process. A checkpoint can be
-claimed once. If the process stops after claiming it, the debugger reports an
-unconfirmed outcome. Use a new directory for a new demo run.
+The approval checkpoint commits the model response and pending call together.
+`resume` records the approval and claims dispatch before invoking the tool.
+Use a new directory for each demo run.
 
-Checkpoint files can contain full model inputs and tool arguments. Resume only
-from checkpoints you trust and use the same agent and tool configuration.
+## Recover from a saved tool result
+
+Run these commands from the repository root. The `interrupt` command exits with
+an error after committing the tool result. The debugger then shows checkpoint 2
+with **Continue from saved result**.
+
+```bash
+python examples/tool_breakpoint.py pause traces/recovery-demo
+python examples/tool_breakpoint.py interrupt traces/recovery-demo
+pincer debug traces/recovery-demo/paused.jsonl --checkpoint traces/recovery-demo/checkpoint.sqlite3 --list
+python -m pincer.cli recover traces/recovery-demo/checkpoint.sqlite3 --agent examples.tool_breakpoint:recovery_profile --checkpoint 2
+```
+
+`pincer recover DB --agent MODULE:FACTORY` selects the current checkpoint by
+default. Add `--approve` to authorize a pending dispatch. A committed tool
+result resumes model execution with the saved output. A claimed dispatch
+without a committed result is shown as **Outcome unconfirmed** and blocks
+continuation. While the next call is still awaiting approval, selecting the
+preceding saved result reruns the model turn and supersedes that pending call.
+Each continuation records an attempt and starts a new trace.
+
+The factory returns a `RecoveryProfile` with the agent, run configuration, and
+the configuration ID passed to `save_breakpoint`. Use a versioned ID and rebuild
+the same agent and tool configuration. The prototype covers one pending local
+function call at a time, with approval required for each configured tool and
+run context stored as a JSON-serializable mapping when supplied.
+Checkpoint databases can contain full model inputs and tool arguments. Use
+trusted checkpoints and factories, and keep the database and its `.lock` file
+in place while a worker is running.
+
+Python integrations can call `save_breakpoint`, `resume_breakpoint`, and
+`recover_checkpoint` from `pincer.runner`. Pass the active
+`OpenAIAgentsTraceAdapter` as `trace_adapter` and save the initial breakpoint
+inside the trace scope to link checkpoints to debugger steps.
 
 ## Attach to your agent
 

@@ -39,10 +39,13 @@ class OpenAIAgentsTraceAdapter(TracingProcessor):
         self.capture_content = capture_content
         self._lock = Lock()
         self._sequence = 0
+        self._last_model_spans: dict[str, str] = {}
         self.write_errors = 0
 
     def _record(self, event: str, item: Any) -> None:
         with self._lock:
+            if event == "trace.ended":
+                self._last_model_spans.pop(item.trace_id, None)
             try:
                 is_span = event.startswith("span.")
                 data = item.span_data if is_span else None
@@ -97,10 +100,17 @@ class OpenAIAgentsTraceAdapter(TracingProcessor):
                         self._file.close()
                     raise OSError("Incomplete trace write")
                 self._sequence += 1
+                if event == "span.ended" and record["kind"] == "model":
+                    self._last_model_spans[item.trace_id] = item.span_id
             except Exception:
                 self.write_errors += 1
                 # Exception text may include user payloads; do not log it.
                 logger.error("Pincer could not record a trace event; inspect write_errors.")
+
+    def last_model_span_id(self, trace_id: str) -> str | None:
+        """Return the latest recorded model boundary within an active trace."""
+        with self._lock:
+            return self._last_model_spans.get(trace_id)
 
     def on_trace_start(self, trace):
         self._record("trace.started", trace)

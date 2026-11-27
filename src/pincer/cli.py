@@ -1,4 +1,4 @@
-"""Read saved traces without running the agent or contacting a provider."""
+"""Inspect saved traces or explicitly continue a saved run."""
 import argparse
 import json
 import sys
@@ -45,8 +45,11 @@ def main(argv=None):
     if argv and argv[0] == "debug":
         from .debugger import main as debug_main
         return debug_main(argv[1:])
+    if argv and argv[0] == "recover":
+        from .recovery_cli import main as recover_main
+        return recover_main(argv[1:])
     parser = argparse.ArgumentParser(
-        description=__doc__, epilog="Inspect individual steps: pincer debug TRACE"
+        description=__doc__, epilog="See pincer debug --help and pincer recover --help."
     )
     parser.add_argument("trace", type=Path)
     args = parser.parse_args(argv)
